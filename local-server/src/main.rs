@@ -101,6 +101,10 @@ async fn main() {
       get(get_items).post(create_item).options(options_items),
     )
     .route(
+      "/wishlist",
+      get(get_wishlist).options(options_items),
+    )
+    .route(
       "/collections",
       get(get_collections).post(create_collection).options(options_collections),
     )
@@ -210,6 +214,32 @@ async fn get_items(
       let mut resp = (StatusCode::OK, axum::Json(Vec::<Item>::new())).into_response();
       resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
       resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET,POST,OPTIONS"));
+      resp.into_response()
+    }
+  }
+}
+
+async fn get_wishlist(
+  db: axum::extract::State<SqlitePool>,
+) -> impl axum::response::IntoResponse {
+  let items_res = sqlx::query_as::<_, Item>(
+    "SELECT id, title, description, picture_url, author, genres, collection, completed, updated_at FROM items WHERE collection = 'Wishlist'"
+  )
+  .fetch_all(&*db)
+  .await;
+
+  match items_res {
+    Ok(items) => {
+      let mut resp = (StatusCode::OK, axum::Json(items)).into_response();
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET,OPTIONS"));
+      resp.into_response()
+    }
+    Err(e) => {
+      eprintln!("get_wishlist query error: {}", e);
+      let mut resp = (StatusCode::OK, axum::Json(Vec::<Item>::new())).into_response();
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET,OPTIONS"));
       resp.into_response()
     }
   }
