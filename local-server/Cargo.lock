@@ -839,7 +839,9 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "dirs",
+ "http 0.2.12",
  "serde",
+ "serde_json",
  "sqlx",
  "tokio",
  "tower-http",

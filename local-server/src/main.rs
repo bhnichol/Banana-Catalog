@@ -1,6 +1,7 @@
-use axum::{routing::get, routing::put, Json, Router};
+use axum::{routing::get, routing::put, routing::delete, Json, Router};
 use serde::{Deserialize, Serialize};
-use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
+use serde_json;
+use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, Row};
 use uuid::Uuid;
 use std::time::{SystemTime, UNIX_EPOCH};
 use dirs::data_local_dir;
@@ -18,6 +19,8 @@ struct Item {
   description: Option<String>,
   picture_url: Option<String>,
   author: Option<String>,
+  genres: Option<String>,
+  collection: Option<String>,
   completed: bool,
   updated_at: i64,
 }
@@ -28,6 +31,8 @@ struct CreateItem {
   description: Option<String>,
   picture_url: Option<String>,
   author: Option<String>,
+  genres: Option<Vec<String>>,
+  collection: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -36,6 +41,8 @@ struct UpdateItem {
   description: Option<String>,
   picture_url: Option<String>,
   author: Option<String>,
+  genres: Option<Vec<String>>,
+  collection: Option<String>,
 }
 
 #[tokio::main]
@@ -57,13 +64,58 @@ async fn main() {
     .await
     .unwrap();
 
+  // Ensure 'collection' column exists (migrate older DBs)
+  let pragma_rows = sqlx::query("PRAGMA table_info(items)")
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+  let mut has_collection = false;
+  let mut has_genres = false;
+  for r in &pragma_rows {
+    if let Ok(name) = r.try_get::<String, &str>("name") {
+      if name == "collection" {
+        has_collection = true;
+      }
+      if name == "genres" {
+        has_genres = true;
+      }
+    }
+  }
+
+  if !has_collection {
+    let _ = sqlx::query("ALTER TABLE items ADD COLUMN collection TEXT DEFAULT 'Default'")
+      .execute(&db)
+      .await;
+  }
+
+  if !has_genres {
+    let _ = sqlx::query("ALTER TABLE items ADD COLUMN genres TEXT")
+      .execute(&db)
+      .await;
+  }
+
   let app = Router::new()
     .route(
       "/items",
       get(get_items).post(create_item).options(options_items),
     )
-    .route("/items/:id", put(update_item).options(options_item_by_id))
+    .route(
+      "/collections",
+      get(get_collections).post(create_collection).options(options_collections),
+    )
+    .route(
+      "/collections/:name",
+      delete(delete_collection).options(options_collections),
+    )
+    .route(
+      "/items/:id",
+      put(update_item).delete(delete_item).options(options_item_by_id),
+    )
     .with_state(db);
+
+  // CORS handled per-route via OPTIONS handlers
+  // no global CORS layer; per-route OPTIONS handlers provide CORS response
 
   let listener = tokio::net::TcpListener::bind("127.0.0.1:4321")
     .await
@@ -76,11 +128,72 @@ async fn main() {
     .unwrap();
 }
 
+async fn get_collections(db: axum::extract::State<SqlitePool>) -> impl axum::response::IntoResponse {
+  let res = sqlx::query("SELECT name, created_at FROM collections ORDER BY name")
+    .fetch_all(&*db)
+    .await;
+
+  match res {
+    Ok(rows) => {
+      let mut cols: Vec<(String, i64)> = Vec::new();
+      for r in rows.into_iter() {
+        let name: String = match r.try_get("name") {
+          Ok(n) => n,
+          Err(_) => continue,
+        };
+        let created_at: i64 = match r.try_get("created_at") {
+          Ok(ts) => ts,
+          Err(_) => 0,
+        };
+        cols.push((name, created_at));
+      }
+      let mut resp = (StatusCode::OK, axum::Json(cols)).into_response();
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+      resp.into_response()
+    }
+    Err(e) => {
+      eprintln!("get_collections error: {}", e);
+      let mut resp = (StatusCode::OK, axum::Json(Vec::<(String,i64)>::new())).into_response();
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+      resp.into_response()
+    }
+  }
+}
+
+#[derive(Deserialize)]
+struct CreateCollection { name: String }
+
+async fn create_collection(
+  db: axum::extract::State<SqlitePool>,
+  Json(payload): Json<CreateCollection>,
+) -> impl axum::response::IntoResponse {
+  let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+  let res = sqlx::query("INSERT OR IGNORE INTO collections (name, created_at) VALUES (?, ?)")
+    .bind(&payload.name)
+    .bind(now)
+    .execute(&*db)
+    .await;
+
+  match res {
+    Ok(_) => {
+      let mut resp = (StatusCode::CREATED, "").into_response();
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+      resp.into_response()
+    }
+    Err(e) => {
+      eprintln!("create_collection error: {}", e);
+      let mut resp = (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+      resp.into_response()
+    }
+  }
+}
+
 async fn get_items(
   db: axum::extract::State<SqlitePool>,
 ) -> impl axum::response::IntoResponse {
   let items_res = sqlx::query_as::<_, Item>(
-    "SELECT id, title, completed, updated_at FROM items"
+    "SELECT id, title, description, picture_url, author, genres, collection, completed, updated_at FROM items"
   )
   .fetch_all(&*db)
   .await;
@@ -111,24 +224,33 @@ async fn create_item(
     .unwrap()
     .as_secs() as i64;
 
+  let genres_json = payload
+    .genres
+    .as_ref()
+    .map(|g| serde_json::to_string(g).unwrap_or_else(|_| "[]".to_string()));
+
   let item = Item {
     id: Uuid::new_v4().to_string(),
     title: payload.title,
     description: payload.description,
     picture_url: payload.picture_url,
     author: payload.author,
+    genres: genres_json.clone(),
+    collection: payload.collection.or(Some("Default".to_string())),
     completed: false,
     updated_at: now,
   };
 
   let res = sqlx::query(
-    "INSERT INTO items (id, title, description, picture_url, author, completed, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO items (id, title, description, picture_url, author, genres, collection, completed, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
   )
   .bind(&item.id)
   .bind(&item.title)
   .bind(&item.description)
   .bind(&item.picture_url)
   .bind(&item.author)
+  .bind(&item.genres)
+  .bind(&item.collection)
   .bind(item.completed as i32)
   .bind(item.updated_at)
   .execute(&*db)
@@ -153,6 +275,14 @@ async fn options_items() -> impl axum::response::IntoResponse {
   let mut resp = StatusCode::NO_CONTENT.into_response();
   resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
   resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET,POST,OPTIONS"));
+  resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type"));
+  resp
+}
+
+async fn options_collections() -> impl axum::response::IntoResponse {
+  let mut resp = StatusCode::NO_CONTENT.into_response();
+  resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+  resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET,POST,DELETE,OPTIONS"));
   resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type"));
   resp
 }
@@ -187,6 +317,13 @@ async fn update_item(
     query_str.push_str(", author = ?");
     bindings.push(format!("'{}'", payload.author.as_ref().unwrap().replace("'", "''")));
   }
+  if payload.genres.is_some() {
+    query_str.push_str(", genres = ?");
+  }
+  if payload.collection.is_some() {
+    query_str.push_str(", collection = ?");
+    bindings.push(format!("'{}'", payload.collection.as_ref().unwrap().replace("'", "''")));
+  }
   query_str.push_str(" WHERE id = ?");
   bindings.push(format!("'{}'", id.replace("'", "''")));
 
@@ -204,6 +341,13 @@ async fn update_item(
   if let Some(a) = payload.author {
     query = query.bind(a);
   }
+  if let Some(g) = payload.genres {
+    let json = serde_json::to_string(&g).unwrap_or_else(|_| "[]".to_string());
+    query = query.bind(json);
+  }
+  if let Some(c) = payload.collection {
+    query = query.bind(c);
+  }
   query = query.bind(&id);
 
   let res = query.execute(&*db).await;
@@ -212,7 +356,7 @@ async fn update_item(
     Ok(_) => {
       // Fetch the updated item to return it
       let fetch_res = sqlx::query_as::<_, Item>(
-        "SELECT id, title, description, picture_url, author, completed, updated_at FROM items WHERE id = ?"
+        "SELECT id, title, description, picture_url, author, genres, collection, completed, updated_at FROM items WHERE id = ?"
       )
       .bind(&id)
       .fetch_optional(&*db)
@@ -240,10 +384,72 @@ async fn update_item(
   }
 }
 
+async fn delete_item(
+  axum::extract::Path(id): axum::extract::Path<String>,
+  db: axum::extract::State<SqlitePool>,
+) -> impl axum::response::IntoResponse {
+  let res = sqlx::query("DELETE FROM items WHERE id = ?")
+    .bind(&id)
+    .execute(&*db)
+    .await;
+
+  match res {
+    Ok(_) => {
+      let mut resp = (StatusCode::NO_CONTENT, "").into_response();
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+      resp.into_response()
+    }
+    Err(e) => {
+      eprintln!("delete_item error: {}", e);
+      let mut resp = (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+      resp.into_response()
+    }
+  }
+}
+
+async fn delete_collection(
+  axum::extract::Path(name): axum::extract::Path<String>,
+  db: axum::extract::State<SqlitePool>,
+) -> impl axum::response::IntoResponse {
+  // When deleting a collection, move items to 'Default' collection first
+  let tx_res = sqlx::query("UPDATE items SET collection = 'Default' WHERE collection = ?")
+    .bind(&name)
+    .execute(&*db)
+    .await;
+
+  if let Err(e) = tx_res {
+    eprintln!("delete_collection update items error: {}", e);
+    let mut resp = (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+    resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    return resp;
+  }
+
+  let res = sqlx::query("DELETE FROM collections WHERE name = ?")
+    .bind(&name)
+    .execute(&*db)
+    .await;
+
+  match res {
+    Ok(_) => {
+      let mut resp = (StatusCode::NO_CONTENT, "").into_response();
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET,POST,DELETE,OPTIONS"));
+      resp.into_response()
+    }
+    Err(e) => {
+      eprintln!("delete_collection error: {}", e);
+      let mut resp = (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+      resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+      resp.into_response()
+    }
+  }
+}
+
 async fn options_item_by_id() -> impl axum::response::IntoResponse {
   let mut resp = StatusCode::NO_CONTENT.into_response();
   resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-  resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("PUT,OPTIONS"));
+  resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("PUT,DELETE,OPTIONS"));
   resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type"));
   resp
 }
